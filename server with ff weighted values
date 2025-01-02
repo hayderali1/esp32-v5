@@ -1,0 +1,188 @@
+const express = require('express');
+const http = require('http');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const socketIo = require('socket.io');
+const XLSX = require('xlsx'); // Add XLSX library
+const fs = require('fs');
+const { fingerprintDatabase } = require('./fingerprintDatabase.js'); // Import the new database
+
+const app = express();
+const server = http.createServer(app);
+
+// Enable CORS for frontend access
+app.use(cors({
+  origin: 'http://localhost:3000',
+  methods: ['GET', 'POST'],
+  credentials: true,
+}));
+
+const io = socketIo(server, {
+  cors: {
+    origin: "http://localhost:3000",
+    methods: ["GET", "POST"],
+    credentials: true,
+  },
+});
+
+// Stationary ESP32 position
+const stationaryDevice = { x: 0, y: 0 }; // down-left corner
+
+// Function to calculate weighted position from fingerprint database
+function calculateWeightedPosition(rssi, k = 3) {
+  const fluctuationFactors = [
+    0.521615884, 0.361594203, 0.445699856, 0.433777541, 0.473041403, 0.546540027,
+    0.474595158, 0.384126984, 0.499265138, 0.434658218, 0.425925926, 0.561187019,
+    0.263939394, 0.420740741, 0.302432136, 0.409580071, 0.543631897, 0.498878183,
+    0.747438645, 0.674881693, 0.5154995, 0.126984127, 0.29281362, 0.669201503,
+    0.532923497, 0.731816831, 0.325956284, 0.477777778, 0.557310114, 0.330964591,
+    0.365957535, 0.408520075, 0.203125, 0.49344236, 0.509866522, 0.31127451,
+    0.341045911, 0.419015552, 0.355550726, 0.35787037, 0.537077434, 0.566999184,
+    0.521707678, 0.636893455, 0.490243364, 0.525419406, 0.397685185, 0.485680751,
+    0.445927318, 0.365972222, 0.614821949, 0.499319028, 0.48696287, 0.432686335,
+    0.58864651, 0.562737237, 0.372981248, 0.601906719, 0.547108263, 0.329963464,
+    0.434282626, 0.486599031, 0.460560676, 0.472284395, 0.509269073, 0.301058201,
+    0.389615385, 0.408602151, 0.505312722, 0.60872533, 0.428518923, 0.708888127,
+    0.474048205, 0.469501134, 0.49032477, 0.526488095, 0.284037559, 0.448926895,
+    0.366666667, 0.297207885, 0.390375587, 0.503936508, 0.421545202, 0.434917251,
+    0.580156796, 0.377363445, 0.35047619, 0.420238095, 0.496113111, 0.477715774,
+    0.550058689, 0.622365477, 0.552139011, 0.401893939, 0.601803752, 0.551712001,
+    0.418501984, 0.545935374
+  ];
+
+  const weightedPositions = fingerprintDatabase.map((fingerprint, index) => {
+    const ff = fluctuationFactors[index];
+    const weight = 1 / (Math.abs(fingerprint.rssi - rssi) * ff); // Updated weight calculation
+    return {
+      x: fingerprint.x,
+      y: fingerprint.y,
+      weight: weight,
+    };
+  });
+
+  weightedPositions.sort((a, b) => b.weight - a.weight);
+
+  const topK = weightedPositions.slice(0, k);
+
+  let totalWeight = 0;
+  let weightedX = 0;
+  let weightedY = 0;
+
+  topK.forEach((pos) => {
+    totalWeight += pos.weight;
+    weightedX += pos.x * pos.weight;
+    weightedY += pos.y * pos.weight;
+  });
+
+  return {
+    x: weightedX / totalWeight,
+    y: weightedY / totalWeight,
+  };
+}
+
+// BLE signal strength data
+let bleData = {};
+const INACTIVITY_THRESHOLD = 10000; // 10 seconds for device inactivity
+
+// Middleware
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(bodyParser.json());
+
+// Serve the frontend
+app.get('/', (req, res) => {
+  res.sendFile(__dirname + '/index.html');
+});
+
+// Function to save position data to an Excel file
+function saveToExcel(device, position, rssi) {
+  const fileName = 'positions.xlsx';
+  let workbook;
+  let sheet;
+
+  if (fs.existsSync(fileName)) {
+    workbook = XLSX.readFile(fileName);
+    sheet = workbook.Sheets["Sheet1"];
+  } else {
+    workbook = XLSX.utils.book_new();
+    sheet = XLSX.utils.aoa_to_sheet([["Device", "X", "Y", "RSSI"]]); // Add "RSSI" header
+    XLSX.utils.book_append_sheet(workbook, sheet, "Sheet1");
+  }
+
+  const data = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+  data.push([device, position.x, position.y, rssi]); // Include RSSI in the saved data
+  const newSheet = XLSX.utils.aoa_to_sheet(data);
+  workbook.Sheets["Sheet1"] = newSheet;
+
+  XLSX.writeFile(workbook, fileName);
+  console.log(`Position and RSSI for ${device} saved to ${fileName}`);
+}
+
+// Handle incoming RSSI data
+app.post('/update-location', (req, res) => {
+  const { device, rssi, esp32_address } = req.body;
+
+  if (!device || !rssi || !esp32_address) {
+    return res.status(400).send('Missing required fields: device, rssi, or esp32_address');
+  }
+
+  console.log(`Received data: Device=${device}, RSSI=${rssi}, ESP32=${esp32_address}`);
+
+  if (!bleData[device]) {
+    bleData[device] = { rssi: [], position: null, lastUpdateTime: Date.now() };
+  }
+
+  bleData[device].rssi.push(Number(rssi));
+  bleData[device].lastUpdateTime = Date.now();
+
+  if (bleData[device].rssi.length > 10) bleData[device].rssi.shift();
+
+  // Use the latest RSSI value
+  const latestRssi = bleData[device].rssi[bleData[device].rssi.length - 1];
+  const position = calculateWeightedPosition(latestRssi);
+
+  if (position) {
+    bleData[device].position = position;
+    saveToExcel(device, position, latestRssi); // Pass the RSSI value
+
+    // Calculate distance from stationary ESP32 to the device
+    const distance = Math.sqrt(
+      Math.pow(position.x - stationaryDevice.x, 2) +
+      Math.pow(position.y - stationaryDevice.y, 2)
+    );
+
+    console.log(`Updated position for ${device}: (${position.x}, ${position.y}), Distance from stationary: ${distance.toFixed(2)} units`);
+  } else {
+    console.log(`No matching fingerprint found for ${device}`);
+  }
+
+  io.emit('updateCanvas', { stationaryDevice, bleData });
+  res.sendStatus(200);
+});
+
+// Periodically clean up inactive devices
+setInterval(() => {
+  const currentTime = Date.now();
+  for (const device in bleData) {
+    if (currentTime - bleData[device].lastUpdateTime > INACTIVITY_THRESHOLD) {
+      console.log(`Removing inactive device: ${device}`);
+      delete bleData[device];
+    }
+  }
+  io.emit('updateCanvas', { stationaryDevice, bleData });
+}, 1000);
+
+// Handle client connections
+io.on('connection', (socket) => {
+  console.log('Client connected');
+  socket.emit('updateCanvas', { stationaryDevice, bleData });
+
+  socket.on('disconnect', () => {
+    console.log('Client disconnected');
+  });
+});
+
+// Start the server
+const PORT = 3000;
+server.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+});
